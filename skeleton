@@ -1,0 +1,65 @@
+import matplotlib.pyplot as plt
+from skimage.morphology import skeletonize
+from skimage import io, color, measure
+import numpy as np
+import cv2 as cv
+
+# Membaca gambar
+image_path = "kayu.png"
+image = io.imread(image_path)
+
+# Hilangkan alpha jika ada
+if image.shape[2] == 4:
+    image = image[:, :, :3]
+
+# Konversi ke grayscale float 0-1
+gray_float = color.rgb2gray(image)
+
+# Invert grayscale agar tulisan jadi terang, background gelap
+gray_inverted = 1 - gray_float
+
+# Skala ke 0-255 uint8
+gray_uint8 = (gray_inverted * 255).astype(np.uint8)
+
+# Threshold Otsu
+_, binary = cv.threshold(gray_uint8, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU)
+
+# Labeling dan analisis komponen
+labeled_image, num_labels = measure.label(binary, return_num=True, connectivity=2)
+props = measure.regionprops(labeled_image)
+
+main_components = np.zeros_like(binary, dtype=bool)
+dot_components = np.zeros_like(binary, dtype=bool)
+
+for prop in props:
+    if prop.area > 50:
+        main_components[labeled_image == prop.label] = True
+    elif prop.area > 5:
+        min_distance = np.min([
+            np.linalg.norm(np.array(prop.centroid) - np.array(main_prop.centroid))
+            for main_prop in props if main_prop.area > 45
+        ])
+        if min_distance < 27:
+            dot_components[labeled_image == prop.label] = True
+
+cleaned_binary = main_components | dot_components
+
+# Skeletonisasi
+skeleton = skeletonize(cleaned_binary)
+
+# Dictionary hasil untuk ditampilkan satu per satu
+outputs = {
+    "Grayscale Image": gray_inverted,
+    "Thresholding Image": binary,
+    "Cleaned Thresholding Image": cleaned_binary,
+    "Skeletonized Image": skeleton
+}
+
+# Tampilkan setiap gambar dalam figure terpisah
+for title, img in outputs.items():
+    plt.figure(figsize=(6, 6))
+    plt.imshow(img, cmap='gray')
+    plt.title(title, fontsize=15)
+    plt.axis('off')
+    plt.tight_layout()
+    plt.show()
