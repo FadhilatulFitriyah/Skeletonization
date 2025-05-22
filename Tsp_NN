@@ -1,0 +1,128 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from skimage.morphology import skeletonize
+from skimage import io, color, filters
+from skimage.measure import label, regionprops
+from scipy.spatial.distance import euclidean
+
+# --- LOAD DAN PREPROSES IMAGE ---
+image_path = "kayu.png"
+image = io.imread(image_path)
+
+if image.shape[-1] == 4:
+    image = image[:, :, :3]
+gray = color.rgb2gray(image)
+thresh = filters.threshold_otsu(gray)
+binary = gray < thresh
+
+labeled_image = label(binary)
+props = regionprops(labeled_image)
+
+main_components = np.zeros_like(binary)
+dot_components = np.zeros_like(binary)
+
+for prop in props:
+    if prop.area > 50:
+        main_components[labeled_image == prop.label] = 1
+    elif prop.area > 5:
+        min_distance = np.min([
+            np.linalg.norm(np.array(prop.centroid) - np.array(main_prop.centroid))
+            for main_prop in props if main_prop.area > 45
+        ])
+        if min_distance < 27:
+            dot_components[labeled_image == prop.label] = 1
+
+cleaned_binary = main_components + dot_components
+skeleton = skeletonize(cleaned_binary)
+
+y_coords, x_coords = np.where(skeleton)
+nodes = sorted(list(zip(y_coords, x_coords)))
+start_node = max(nodes, key=lambda n: (n[1], -n[0]))  # Titik paling kanan atas
+
+# --- FUNGSI UNTUK MEMECAH TSP ---
+def split_tsp_paths(start, nodes, threshold=2.0):
+    remaining_nodes = list(nodes)
+    tsp_segments = []
+    current_path = [start]
+    remaining_nodes.remove(start)
+    distances_info = []
+
+    while remaining_nodes:
+        last_node = current_path[-1]
+        nearest = min(remaining_nodes, key=lambda n: (euclidean(last_node, n), n[0], n[1]))
+        d = euclidean(last_node, nearest)
+
+        distances_info.append({
+            'from': last_node,
+            'to': nearest,
+            'distance': d
+        })
+
+        if d > threshold:
+            tsp_segments.append(current_path)
+            current_path = [nearest]
+        else:
+            current_path.append(nearest)
+
+        remaining_nodes.remove(nearest)
+
+    if current_path:
+        tsp_segments.append(current_path)
+
+    return tsp_segments, distances_info
+
+sub_paths, distances_info = split_tsp_paths(start_node, nodes, threshold=3.0)
+
+# --- VISUALISASI JALUR DENGAN JARAK EUCLIDEAN ---
+colors = ['red', 'blue', 'green', 'orange', 'purple', 'cyan', 'magenta']
+fig, ax = plt.subplots(figsize=(6, 6))
+ax.imshow(skeleton, cmap="gray")
+
+for idx, segment in enumerate(sub_paths):
+    path_distance = 0.0
+    for i in range(len(segment) - 1):
+        (y1, x1), (y2, x2) = segment[i], segment[i + 1]
+        color = colors[idx % len(colors)]
+        d = euclidean((y1, x1), (y2, x2))
+        path_distance += d
+
+        # Gambar garis
+        ax.plot([x1, x2], [y1, y2], marker='o', markersize=2, color=color)
+
+        # Tampilkan jarak di tengah garis
+        mid_x = (x1 + x2) / 2
+        mid_y = (y1 + y2) / 2
+        ax.text(mid_x, mid_y, f"{d:.2f}", fontsize=6, color='yellow')
+
+    # Total jarak untuk sub-path ini (di akhir segmen)
+    end_y, end_x = segment[-1]
+    ax.text(end_x + 5, end_y + 5, f"{path_distance:.1f}", color=colors[idx % len(colors)],
+            fontsize=7, bbox=dict(facecolor='white', alpha=0.8, boxstyle='round'))
+
+ax.set_title("TSP Path with Euclidean Distances")
+ax.axis("off")
+plt.tight_layout()
+plt.show()
+
+# --- CETAK DETAIL TIAP SUB-PATH KE TERMINAL ---
+print("\n=== Sub-path details ===")
+index_global = 1
+total_distance = 0
+
+for i, path in enumerate(sub_paths):
+    print(f"\nSub-path {i+1}:")
+    path_dist = 0
+    for j in range(len(path)):
+        p1 = path[j]
+        x, y = p1[1], p1[0]
+        if j < len(path) - 1:
+            dist = euclidean(p1, path[j+1])
+            path_dist += dist
+            total_distance += dist
+        else:
+            dist = 0
+        print(f"{index_global}. Point ({x}, {y}) | Jarak : {dist:.2f}")
+        index_global += 1
+    print(f"  Total jarak sub-path {i+1}: {path_dist:.2f}")
+
+print(f"\nTotal Euclidean Distance (semua sub-path): {total_distance:.2f}")
