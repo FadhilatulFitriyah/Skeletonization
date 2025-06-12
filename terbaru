@@ -1,0 +1,269 @@
+import matplotlib.pyplot as plt
+from skimage.morphology import skeletonize
+from skimage import io, color, measure
+import numpy as np
+import cv2 as cv
+from scipy.ndimage import center_of_mass
+from scipy.spatial.distance import euclidean
+
+# =================== Bagian 1: Load Gambar dan Preprocessing + Skeletonisasi ====================
+def preprocess_and_skeletonize(image_path, skeleton_method='default'):
+    image = io.imread(image_path)
+    if image.shape[2] == 4:
+        image = image[:, :, :3]
+
+    gray_float = color.rgb2gray(image)
+    gray_inverted = 1 - gray_float
+    gray_uint8 = (gray_inverted * 255).astype(np.uint8)
+    _, binary = cv.threshold(gray_uint8, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU)
+
+    labeled_image, num_labels = measure.label(binary, return_num=True, connectivity=2)
+    props = measure.regionprops(labeled_image)
+
+    main_components = np.zeros_like(binary, dtype=bool)
+    dot_components = np.zeros_like(binary, dtype=bool)
+    dot_mask = np.zeros_like(binary, dtype=np.uint8)
+
+    for prop in props:
+        area = prop.area
+        bbox = prop.bbox
+        height = bbox[2] - bbox[0]
+        width = bbox[3] - bbox[1]
+        aspect_ratio = height / (width + 1e-5)
+
+        if area > 50:
+            main_components[labeled_image == prop.label] = True
+        elif area > 10 and aspect_ratio > 3.5:
+            main_components[labeled_image == prop.label] = True
+        elif area > 2:
+            min_distance = np.min([
+                np.linalg.norm(np.array(prop.centroid) - np.array(main_prop.centroid))
+                for main_prop in props if main_prop.area > 45
+            ])
+            if min_distance < 60:
+                dot_components[labeled_image == prop.label] = True
+                cy, cx = map(int, prop.centroid)
+                main_centroids = [main_prop.centroid for main_prop in props if main_prop.area > 45]
+                if main_centroids:
+                    closest_main = min(main_centroids, key=lambda c: abs(c[0] - cy))
+                    if cy < closest_main[0]:
+                        dot_mask[labeled_image == prop.label] = 1
+                    else:
+                        dot_mask[labeled_image == prop.label] = 2
+
+    cleaned_binary = main_components | dot_components
+
+    if skeleton_method == 'lee':
+        skeleton = skeletonize(cleaned_binary, method='lee')
+    else:
+        skeleton = skeletonize(cleaned_binary)
+
+    return skeleton, cleaned_binary, labeled_image, props, main_components, dot_mask
+
+# =================== Tambahan Validasi Dot ====================
+def validate_dot_follows_mainstructure(dot_centroid, main_info, dot_position, distance_threshold=60, margin=5):
+    main_cy, main_cx = main_info['centroid']
+    min_row, min_col, max_row, max_col = main_info['bbox']
+
+    dist = euclidean(dot_centroid, (main_cy, main_cx))
+    cx, cy = dot_centroid[1], dot_centroid[0]
+
+    in_horizontal_range = (min_col - margin <= cx <= max_col + margin)
+    in_vertical_logic = (cy < main_cy and dot_position == 1) or (cy >= main_cy and dot_position == 2)
+
+    is_valid = dist < distance_threshold and in_horizontal_range and in_vertical_logic
+
+    return is_valid
+
+# =================== Titik Penting ====================
+def find_keypoints(skel):
+    endpoints, intersections, turns = [], [], []
+    for i in range(1, skel.shape[0]-1):
+        for j in range(1, skel.shape[1]-1):
+            if skel[i, j]:
+                neighborhood = skel[i-1:i+2, j-1:j+2]
+                num_neighbors = np.sum(neighborhood) - 1
+                if num_neighbors == 1:
+                    endpoints.append((i, j))
+                elif num_neighbors >= 3:
+                    intersections.append((i, j))
+                else:
+                    horizontal = skel[i, j-1] + skel[i, j+1]
+                    vertical = skel[i-1, j] + skel[i+1, j]
+                    if horizontal == 1 and vertical == 1:
+                        turns.append((i, j))
+    return np.array(endpoints), np.array(intersections), np.array(turns)
+
+# =================== Ekstraksi Fitur dengan Validasi Dot ====================
+def extract_features(props, skeleton, labeled_image, main_components, dot_mask):
+    component_features = {}
+    main_components_info = {}
+
+    for prop in props:
+        if main_components[labeled_image == prop.label].any():
+            main_components_info[prop.label] = {
+                'centroid': prop.centroid,
+                'bbox': prop.bbox,
+                'points': np.argwhere(labeled_image == prop.label)
+            }
+
+    for prop in props:
+        if dot_mask[labeled_image == prop.label].any():
+            dot_label = prop.label
+            dot_centroid = prop.centroid
+            dot_position = dot_mask[labeled_image == prop.label].max()
+
+            nearest_main = None
+            min_distance = float('inf')
+            for main_label, main_info in main_components_info.items():
+                dist = euclidean(dot_centroid, main_info['centroid'])
+                if dist < min_distance:
+                    min_distance = dist
+                    nearest_main = main_label
+
+            if nearest_main is not None:
+                is_valid = validate_dot_follows_mainstructure(dot_centroid, main_components_info[nearest_main], dot_position)
+                if is_valid:
+                    if dot_position == 1:
+                        main_components_info[nearest_main].setdefault('dot_above', []).append(dot_label)
+                    else:
+                        main_components_info[nearest_main].setdefault('dot_below', []).append(dot_label)
+
+    for main_label, main_info in main_components_info.items():
+        all_points = main_info['points'].tolist()
+
+        for dot_label in main_info.get('dot_above', []):
+            dot_points = np.argwhere(labeled_image == dot_label)
+            all_points.extend(dot_points.tolist())
+
+        for dot_label in main_info.get('dot_below', []):
+            dot_points = np.argwhere(labeled_image == dot_label)
+            all_points.extend(dot_points.tolist())
+
+        combined_mask = np.zeros_like(labeled_image, dtype=bool)
+        for point in all_points:
+            combined_mask[point[0], point[1]] = True
+
+        skel_component = skeleton * combined_mask
+        endpoints, intersections, turns = find_keypoints(skel_component)
+
+        component_features[main_label] = {
+            "skeleton_points": np.argwhere(skel_component),
+            "start": endpoints[0] if len(endpoints) > 0 else None,
+            "end": endpoints[-1] if len(endpoints) > 1 else None,
+            "intersections": intersections,
+            "turns": turns,
+            "centroid": main_info['centroid'],
+            "category": "main_with_dots",
+            "dot_above": main_info.get('dot_above', []),
+            "dot_below": main_info.get('dot_below', [])
+        }
+
+    return component_features
+
+# =================== TSP Dengan Prioritas Intersection ====================
+def tsp_with_intersection_priority(points, intersections, dist_threshold=3):
+    if len(points) == 0:
+        return []
+
+    points = [tuple(p) for p in points.tolist()]
+    intersection_points = [tuple(p) for p in intersections.tolist()]
+    remaining_points = points.copy()
+    path = []
+    segments = []
+    current_segment = []
+
+    path.append(remaining_points.pop(0))
+    current_segment = [path[-1]]
+
+    while remaining_points:
+        last = path[-1]
+        if last in intersection_points:
+            connected_points = [p for p in remaining_points if euclidean(last, p) <= dist_threshold]
+            if connected_points:
+                connected_points.sort(key=lambda x: euclidean(last, x))
+                next_point = connected_points[0]
+                remaining_points.remove(next_point)
+                path.append(next_point)
+                current_segment.append(next_point)
+                if next_point in intersection_points and len(current_segment) > 1:
+                    segments.append(current_segment)
+                    current_segment = [next_point]
+                continue
+
+        distances = [euclidean(last, p) for p in remaining_points]
+        idx_min = np.argmin(distances)
+        next_point = remaining_points.pop(idx_min)
+        dist = euclidean(last, next_point)
+
+        if dist > dist_threshold or next_point in intersection_points:
+            if len(current_segment) > 0:
+                segments.append(current_segment)
+            current_segment = [next_point]
+        else:
+            current_segment.append(next_point)
+
+        path.append(next_point)
+
+    if len(current_segment) > 0:
+        segments.append(current_segment)
+    return segments
+
+# =================== Main Program ====================
+image_path = "perbetul.png"
+skeleton, cleaned_binary, labeled_image, props, main_components, dot_mask = preprocess_and_skeletonize(image_path, skeleton_method='default')
+
+component_features = extract_features(props, skeleton, labeled_image, main_components, dot_mask)
+
+color_map = {
+    "main_with_dots": 'b',
+    "dot_above": 'm',
+    "dot_below": 'orange'
+}
+
+fig, ax = plt.subplots(figsize=(10, 10))
+ax.imshow(skeleton, cmap='gray')
+total_distance_all = 0
+
+for idx, (label, feat) in enumerate(component_features.items()):
+    points = feat["skeleton_points"]
+    intersections = feat["intersections"]
+    segments = tsp_with_intersection_priority(points, intersections, dist_threshold=3)
+    color = color_map.get(feat["category"], 'b')
+
+    for segment in segments:
+        for i in range(len(segment) - 1):
+            p1, p2 = segment[i], segment[i + 1]
+            dist = euclidean(p1, p2)
+            total_distance_all += dist
+            ax.plot([p1[1], p2[1]], [p1[0], p2[0]], color=color, linewidth=2)
+            ax.plot(p1[1], p1[0], marker='o', color=color, markersize=4)
+        ax.plot(segment[-1][1], segment[-1][0], marker='o', color=color, markersize=4)
+
+    for dot_label in feat.get("dot_above", []):
+        dot_points = np.argwhere(labeled_image == dot_label)
+        for point in dot_points:
+            ax.plot(point[1], point[0], 'mo', markersize=6)
+
+    for dot_label in feat.get("dot_below", []):
+        dot_points = np.argwhere(labeled_image == dot_label)
+        for point in dot_points:
+            ax.plot(point[1], point[0], 'o', color='orange', markersize=6)
+
+    if feat["start"] is not None:
+        sy, sx = feat["start"]
+        ax.plot(sx, sy, 'bo', markersize=6)
+    if feat["end"] is not None:
+        ey, ex = feat["end"]
+        ax.plot(ex, ey, 'yo', markersize=6)
+    for iy, ix in feat["intersections"]:
+        ax.plot(ix, iy, 'go', markersize=5)
+    for ty, tx in feat["turns"]:
+        ax.plot(tx, ty, 'co', markersize=4)
+    if feat["centroid"] is not None:
+        cy, cx = feat["centroid"]
+        ax.plot(cx, cy, 'ro', markersize=6)
+
+ax.set_title(f"\nTotal Jarak: {total_distance_all:.2f}")
+ax.axis('off')
+plt.show()
