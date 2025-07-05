@@ -1,0 +1,484 @@
+# =================== IMPORT LIBRARY ====================
+import matplotlib.pyplot as plt
+from skimage.morphology import skeletonize
+from skimage import io, color, measure
+import numpy as np
+import cv2 as cv
+import networkx as nx
+from scipy.ndimage import center_of_mass
+from scipy.spatial.distance import euclidean
+from skimage.segmentation import relabel_sequential
+from scipy.spatial import ConvexHull
+from shapely.geometry import Polygon
+
+# =================== 1. LOAD GAMBAR DAN PREPROSESING ====================
+image_path = "menurut.png"
+image = io.imread(image_path)
+if image.shape[2] == 4:
+    image = image[:, :, :3]
+
+gray = 1 - color.rgb2gray(image)
+gray_uint8 = (gray * 255).astype(np.uint8)
+_, binary = cv.threshold(gray_uint8, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU)
+
+labeled_image, _ = measure.label(binary, return_num=True, connectivity=2)
+props = measure.regionprops(labeled_image)
+
+main_components = np.zeros_like(binary, dtype=bool)
+dot_mask = np.zeros_like(binary, dtype=np.uint8)
+label_map = labeled_image.copy()
+main_infos = {}
+
+for prop in props:
+    label = prop.label
+    area = prop.area
+    bbox = prop.bbox
+    height = bbox[2] - bbox[0]
+    width = bbox[3] - bbox[1]
+    aspect_ratio = height / (width + 1e-5)
+    if area > 50 or (area > 10 and aspect_ratio > 3.5):
+        main_components[labeled_image == label] = True
+        main_infos[label] = {
+            "centroid": prop.centroid,
+            "bbox": prop.bbox,
+            "mask": (labeled_image == label)
+        }
+
+for prop in props:
+    label = prop.label
+    if label in main_infos or prop.area <= 2:
+        continue
+    centroid = prop.centroid
+    nearest_main = min(main_infos.items(), key=lambda item: euclidean(centroid, item[1]["centroid"]))[0]
+    dist = euclidean(centroid, main_infos[nearest_main]["centroid"])
+    if dist < 60:
+        cy, _ = map(int, centroid)
+        main_cy = int(main_infos[nearest_main]["centroid"][0])
+        dot_mask[labeled_image == label] = 1 if cy < main_cy else 2
+        label_map[labeled_image == label] = nearest_main
+
+labeled_image, _, _ = relabel_sequential(label_map)
+cleaned_binary = labeled_image > 0
+skeleton = skeletonize(cleaned_binary)
+
+# =================== 2. TITIK-TITIK PENTING ====================
+def find_keypoints(skel):
+    endpoints, intersections, turns = [], [], []
+    for i in range(1, skel.shape[0]-1):
+        for j in range(1, skel.shape[1]-1):
+            if skel[i, j]:
+                neighborhood = skel[i-1:i+2, j-1:j+2]
+                num_neighbors = np.sum(neighborhood) - 1
+                if num_neighbors == 1:
+                    endpoints.append((i, j))
+                elif num_neighbors >= 3:
+                    intersections.append((i, j))
+                else:
+                    h = skel[i, j-1] + skel[i, j+1]
+                    v = skel[i-1, j] + skel[i+1, j]
+                    if h == 1 and v == 1:
+                        turns.append((i, j))
+    return np.array(endpoints), np.array(intersections), np.array(turns)
+
+def skeleton_to_graph(skel):
+    G = nx.Graph()
+    for i in range(1, skel.shape[0] - 1):
+        for j in range(1, skel.shape[1] - 1):
+            if skel[i, j]:
+                for di in [-1, 0, 1]:
+                    for dj in [-1, 0, 1]:
+                        if di == 0 and dj == 0:
+                            continue
+                        ni, nj = i + di, j + dj
+                        if skel[ni, nj]:
+                            G.add_edge((i, j), (ni, nj))
+    return G
+
+# =================== 3. EKSTRAKSI FITUR ====================
+component_features = {}
+for label in np.unique(labeled_image):
+    if label == 0: continue
+    mask = labeled_image == label
+    skel_component = skeleton * mask
+    endpoints, intersections, turns = find_keypoints(skel_component)
+    centroid = center_of_mass(mask)
+    dot_above, dot_below = [], []
+    dot_mask_region = dot_mask[mask]
+    if np.any(dot_mask_region == 1): dot_above.append(label)
+    if np.any(dot_mask_region == 2): dot_below.append(label)
+
+    component_features[label] = {
+        "skeleton_points": np.argwhere(skel_component),
+        "start": endpoints[0] if len(endpoints) > 0 else None,
+        "end": endpoints[-1] if len(endpoints) > 1 else None,
+        "intersections": intersections,
+        "turns": turns,
+        "centroid": centroid,
+        "dot_above": dot_above,
+        "dot_below": dot_below,
+        "has_loop": False,
+        "cycles": [],
+        "loop_count": 0,
+        "largest_loop_area": 0
+    }
+
+def detect_looping_characters(component_features, skeleton, labeled_image):
+    looping_components = []
+
+    for label, feat in component_features.items():
+        mask = labeled_image == label
+        skel_component = skeleton * mask
+
+        if np.sum(skel_component) > 2:
+            G = skeleton_to_graph(skel_component)
+            cycles = nx.cycle_basis(G)
+
+            valid_cycles = []
+            for cycle in cycles:
+                if len(cycle) >= 2:
+                    cycle_array = np.array(cycle)
+                    try:
+                        hull = ConvexHull(cycle_array)
+                        area = hull.volume
+                    except:
+                        area = 0
+                    if area > 1.5:
+                        valid_cycles.append((cycle, area))
+
+            if valid_cycles:
+                looping_components.append(label)
+                component_features[label]["has_loop"] = True
+                component_features[label]["cycles"] = [vc[0] for vc in valid_cycles]
+                component_features[label]["loop_count"] = len(valid_cycles)
+                component_features[label]["largest_loop_area"] = max([vc[1] for vc in valid_cycles])
+            else:
+                component_features[label]["has_loop"] = False
+
+    return looping_components, component_features
+
+looping_components, component_features = detect_looping_characters(component_features, skeleton, labeled_image)
+
+# =================== DETEKSI HURUF TUNGGAL ====================
+huruf_tunggal_loop = []
+huruf_tunggal_simpang = []
+huruf_tunggal_sederhana = []
+
+for label, feat in component_features.items():
+    start = feat["start"]
+    end = feat["end"]
+    has_loop = feat["has_loop"]
+    num_intersections = len(feat["intersections"])
+    skel_pts = feat["skeleton_points"]
+
+    if has_loop:
+        if start is None or end is None or euclidean(start, end) < 10:
+            huruf_tunggal_loop.append(label)
+
+    elif num_intersections > 0:
+        if start is None or end is None or euclidean(start, end) < 10:
+            huruf_tunggal_simpang.append(label)
+
+    elif not has_loop and num_intersections == 0:
+        if len(skel_pts) < 70 or (start is not None and end is not None and euclidean(start, end) < 40):
+            huruf_tunggal_sederhana.append(label)
+
+# =================== FUNGSI POTONG HURUF PRESISI DENGAN FALLBACK KE CONNECTED COMPONENT ====================
+def potong_huruf_presisi_v5(binary_image, skeleton, component_features, labeled_image, ukuran=32, margin=3):
+    hasil_potongan = []
+
+    # =================== 1. Proses huruf tunggal ====================
+    tunggal_labels = huruf_tunggal_loop + huruf_tunggal_simpang + huruf_tunggal_sederhana
+    tunggal_labels = sorted(set(tunggal_labels))
+
+    print(f"\n[INFO] Memotong {len(tunggal_labels)} huruf tunggal:")
+    fig, axes = plt.subplots(1, len(tunggal_labels), figsize=(3 * len(tunggal_labels), 5))
+    if len(tunggal_labels) == 1:
+        axes = [axes]
+
+    for idx, label in enumerate(tunggal_labels):
+        mask = (labeled_image == label).astype(np.uint8)
+        coords = np.argwhere(mask)
+        if coords.size == 0:
+            continue
+
+        minr, minc = np.min(coords, axis=0)
+        maxr, maxc = np.max(coords, axis=0)
+        minr = max(minr - margin, 0)
+        maxr = min(maxr + margin, binary_image.shape[0])
+        minc = max(minc - margin, 0)
+        maxc = min(maxc + margin, binary_image.shape[1])
+
+        crop = binary_image[minr:maxr, minc:maxc]
+
+        # Resize dan pad
+        h, w = crop.shape
+        scale = min(ukuran / w, ukuran / h)
+        new_w = max(1, int(w * scale))
+        new_h = max(1, int(h * scale))
+        resized = cv.resize(crop, (new_w, new_h), interpolation=cv.INTER_NEAREST)
+
+        canvas = np.zeros((ukuran, ukuran), dtype=np.uint8)
+        y_offset = (ukuran - new_h) // 2
+        x_offset = (ukuran - new_w) // 2
+        canvas[y_offset:y_offset + new_h, x_offset:x_offset + new_w] = resized
+
+        hasil_potongan.append(canvas)
+        axes[idx].imshow(canvas, cmap='gray')
+        axes[idx].set_title(f"Huruf Tunggal {idx+1}")
+        axes[idx].axis('off')
+
+    plt.tight_layout()
+    plt.show()
+
+    # =================== 2. Proses huruf bersambung ====================
+    all_cols = []
+    for label, feat in component_features.items():
+        if label in tunggal_labels:
+            continue
+
+        if len(feat["intersections"]) > 0:
+            for iy, ix in feat["intersections"]:
+                all_cols.append(ix)
+
+        if feat["has_loop"]:
+            loop_x = []
+            for cycle in feat["cycles"]:
+                for yx in cycle:
+                    loop_x.append(yx[1])
+            if loop_x:
+                all_cols.extend([min(loop_x) - 2, max(loop_x) + 2])
+
+    # Fallback jika tidak ditemukan titik potong
+    if len(all_cols) == 0:
+        print("[INFO] Tidak ada simpangan/loop, fallback ke connected component untuk huruf bersambung")
+        for label in np.unique(labeled_image):
+            if label == 0 or label in tunggal_labels:
+                continue
+            mask = labeled_image == label
+            coords = np.argwhere(mask)
+            if coords.size > 0:
+                minc = np.min(coords[:, 1])
+                maxc = np.max(coords[:, 1])
+                all_cols.extend([minc, maxc])
+
+    all_cols += [0, binary_image.shape[1] - 1]
+    all_cols = sorted(set(all_cols))
+
+    # Gabungkan titik potong yang terlalu dekat
+    merged_cols = [all_cols[0]]
+    for col in all_cols[1:]:
+        if col - merged_cols[-1] < 5:
+            merged_cols[-1] = (merged_cols[-1] + col) // 2
+        else:
+            merged_cols.append(col)
+
+    print(f"\n[INFO] Memotong huruf bersambung ({len(merged_cols)-1} potongan):")
+    fig, axes = plt.subplots(1, len(merged_cols)-1, figsize=(3 * (len(merged_cols)-1), 5))
+    if len(merged_cols)-1 == 1:
+        axes = [axes]
+
+    for idx in range(len(merged_cols)-1):
+        left = int(np.clip(merged_cols[idx], 0, binary_image.shape[1]))
+        right = int(np.clip(merged_cols[idx+1], 0, binary_image.shape[1]))
+        potongan = binary_image[:, left:right]
+
+        h, w = potongan.shape
+        scale = min(ukuran / w, ukuran / h)
+        new_w = max(1, int(w * scale))
+        new_h = max(1, int(h * scale))
+        potongan_resized = cv.resize(potongan, (new_w, new_h), interpolation=cv.INTER_NEAREST)
+
+        canvas = np.zeros((ukuran, ukuran), dtype=potongan.dtype)
+        y_offset = (ukuran - new_h) // 2
+        x_offset = (ukuran - new_w) // 2
+        canvas[y_offset:y_offset + new_h, x_offset:x_offset + new_w] = potongan_resized
+
+        hasil_potongan.append(canvas)
+        axes[idx].imshow(canvas, cmap='gray')
+        axes[idx].set_title(f"Huruf Sambung {idx+1}")
+        axes[idx].axis('off')
+
+    plt.tight_layout()
+    plt.show()
+          # =================== Visualisasi Garis Potong pada Huruf Tunggal & Bersambung ====================
+    plt.figure(figsize=(10, 5))
+    plt.imshow(binary_image, cmap='gray')
+
+    # Visualisasi bounding box untuk huruf tunggal (loop, simpang, sederhana)
+    all_tunggal = huruf_tunggal_loop + huruf_tunggal_simpang + huruf_tunggal_sederhana
+    for idx, label in enumerate(all_tunggal):
+        mask = (labeled_image == label).astype(np.uint8)
+        coords = np.argwhere(mask)
+        if coords.size == 0:
+            continue
+        minr, minc = np.min(coords, axis=0)
+        maxr, maxc = np.max(coords, axis=0)
+
+        # Tambahkan margin sesuai yang digunakan saat crop
+        minr_vis = max(minr - margin, 0)
+        maxr_vis = min(maxr + margin, binary_image.shape[0])
+        minc_vis = max(minc - margin, 0)
+        maxc_vis = min(maxc + margin, binary_image.shape[1])
+
+        rect = plt.Rectangle(
+            (minc_vis, minr_vis), maxc_vis - minc_vis, maxr_vis - minr_vis,
+            linewidth=1, edgecolor='blue', facecolor='none', linestyle='--',
+            label='Huruf Tunggal (BBox)' if idx == 0 else ""
+        )
+        plt.gca().add_patch(rect)
+
+# Garis merah vertikal untuk huruf bersambung (dari merged_cols)
+    for i, col in enumerate(merged_cols):
+              plt.axvline(x=col, color='red', linestyle='--', linewidth=1.2,
+              label='Potong Huruf Sambung' if i == 0 else "")
+
+    # Hindari duplikat label di legenda
+    handles, labels = plt.gca().get_legend_handles_labels()
+    by_label = dict(zip(labels, handles))
+    plt.legend(by_label.values(), by_label.keys(), loc='upper right')
+
+    plt.title("Visualisasi Garis Potong pada Huruf Tunggal & Bersambung")
+    plt.axis('off')
+    plt.tight_layout()
+    plt.show()
+
+    return hasil_potongan
+
+
+# Panggil fungsi potong huruf versi terbaru
+potongan_huruf = potong_huruf_presisi_v5(binary, skeleton, component_features, labeled_image, ukuran=32, margin=2)
+
+
+# =================== 5. TRAVERSAL (Prefer Lower Point) ====================
+def tsp_skeleton_traversal(points, prefer_lower=True, dist_threshold=3):
+    if len(points) == 0:
+        return []
+    points = points.tolist()
+    points.sort(key=lambda p: p[0], reverse=prefer_lower)
+    start_point = points.pop(0)
+    path = [start_point]
+    segments = []
+    current_segment = [start_point]
+
+    while points:
+        last = path[-1]
+        distances = [euclidean(last, p) for p in points]
+        idx_min = np.argmin(distances)
+        next_point = points.pop(idx_min)
+        dist = euclidean(last, next_point)
+        if dist > dist_threshold:
+            segments.append(current_segment)
+            current_segment = [next_point]
+        else:
+            current_segment.append(next_point)
+        path.append(next_point)
+    segments.append(current_segment)
+    return segments
+
+# =================== 6. VISUALISASI ====================
+fig, ax = plt.subplots(figsize=(10, 10))
+ax.imshow(skeleton, cmap='gray')
+total_distance_all = 0
+legend_flag = {
+    "Start": True, "End": True, "Simpang": True,
+    "Belokan": True, "Centroid": True,
+    "Dot Atas": True, "Dot Bawah": True,
+    "Loop": True,  "Huruf Loop": True,
+    "Huruf Simpang": True,
+    "Huruf Sederhana": True
+}
+
+# Visualisasi koneksi titik diakritik
+for prop in props:
+    label = prop.label
+    if label in main_infos or prop.area <= 2:
+        continue
+    centroid_dot = np.array(prop.centroid)
+    dot_type = dot_mask[int(centroid_dot[0]), int(centroid_dot[1])]
+    if dot_type == 0:
+        continue
+    nearest_main_label = min(main_infos.items(), key=lambda item: euclidean(centroid_dot, item[1]["centroid"]))[0]
+    main_mask = main_infos[nearest_main_label]["mask"]
+    main_coords = np.argwhere(main_mask)
+    x_target = int(centroid_dot[1])
+    candidates = main_coords[main_coords[:, 1] == x_target]
+    if len(candidates) == 0:
+        continue
+    if dot_type == 1:
+        verticals = candidates[candidates[:, 0] > centroid_dot[0]]
+    else:
+        verticals = candidates[candidates[:, 0] < centroid_dot[0]]
+    if len(verticals) == 0:
+        continue
+    idx = np.argmin(np.abs(verticals[:, 0] - centroid_dot[0]))
+    target_point = verticals[idx]
+    ax.plot([centroid_dot[1], target_point[1]], [centroid_dot[0], target_point[0]],
+            color='purple', linestyle='--', linewidth=1, alpha=0.6)
+
+# Visualisasi skeleton dan fitur
+for label, feat in component_features.items():
+    points = feat["skeleton_points"]
+    if len(points) > 0:  # Hanya proses jika ada titik
+        segments = tsp_skeleton_traversal(points, prefer_lower=True, dist_threshold=3)
+        for segment in segments:
+            for i in range(len(segment) - 1):
+                p1, p2 = segment[i], segment[i + 1]
+                total_distance_all += euclidean(p1, p2)
+                ax.plot([p1[1], p2[1]], [p1[0], p2[0]], color='blue', linewidth=1)
+                ax.plot(p1[1], p1[0], 'o', color='blue', markersize=4)
+            ax.plot(segment[-1][1], segment[-1][0], 'o', color='blue', markersize=4)
+
+    # Visualisasi titik fitur
+    if feat["start"] is not None:
+        ax.plot(feat["start"][1], feat["start"][0], 'bo', markersize=6, label="Titik Awal" if legend_flag["Start"] else "")
+        legend_flag["Start"] = False
+    if feat["end"] is not None:
+        ax.plot(feat["end"][1], feat["end"][0], 'yo', markersize=6, label="Titik Akhir" if legend_flag["End"] else "")
+        legend_flag["End"] = False
+    for iy, ix in feat["intersections"]:
+        ax.plot(ix, iy, 'go', markersize=5, label="Simpangan" if legend_flag["Simpang"] else "")
+        legend_flag["Simpang"] = False
+    for ty, tx in feat["turns"]:
+        ax.plot(tx, ty, 'co', markersize=4, label="Belokan" if legend_flag["Belokan"] else "")
+        legend_flag["Belokan"] = False
+    if feat["centroid"] is not None:
+        ax.plot(feat["centroid"][1], feat["centroid"][0], 'ro', markersize=6, label="Centroid" if legend_flag["Centroid"] else "")
+        legend_flag["Centroid"] = False
+
+    # Visualisasi loop jika ada
+    if feat["has_loop"]:
+        for cycle in feat["cycles"]:
+            cycle_array = np.array(cycle)
+            ax.plot(cycle_array[:, 1], cycle_array[:, 0], 'r-', linewidth=2, label="Loop" if legend_flag["Loop"] else "")
+            legend_flag["Loop"] = False
+
+# Visualisasi titik diakritik
+dot_above_pts = np.argwhere(dot_mask == 1)
+if len(dot_above_pts) > 0:
+    ax.plot(dot_above_pts[:,1], dot_above_pts[:,0], 'o', color='magenta', markersize=6, label="Diakritik Atas" if legend_flag["Dot Atas"] else "")
+    legend_flag["Dot Atas"] = False
+
+dot_below_pts = np.argwhere(dot_mask == 2)
+if len(dot_below_pts) > 0:
+    ax.plot(dot_below_pts[:,1], dot_below_pts[:,0], 'o', color='orange', markersize=6, label="Diakritik Bawah" if legend_flag["Dot Bawah"] else "")
+    legend_flag["Dot Bawah"] = False
+
+for label in huruf_tunggal_loop:
+    coords = np.argwhere(labeled_image == label)
+    ax.scatter(coords[:, 1], coords[:, 0], s=1, color='red', label="Huruf Tunggal (Loop)" if legend_flag["Huruf Loop"] else "")
+    legend_flag["Huruf Loop"] = False
+
+for label in huruf_tunggal_simpang:
+    coords = np.argwhere(labeled_image == label)
+    ax.scatter(coords[:, 1], coords[:, 0], s=1, color='blue', label="Huruf Tunggal (Simpang)" if legend_flag["Huruf Simpang"] else "")
+    legend_flag["Huruf Simpang"] = False
+
+for label in huruf_tunggal_sederhana:
+    coords = np.argwhere(labeled_image == label)
+    ax.scatter(coords[:, 1], coords[:, 0], s=1, color='green', label="Huruf Tunggal (Sederhana)" if legend_flag["Huruf Sederhana"] else "")
+    legend_flag["Huruf Sederhana"] = False
+
+ax.set_title(f"Analisis Struktur Huruf + Diakritik\nTotal Jarak: {total_distance_all:.2f}")
+ax.axis('off')
+ax.legend(loc='upper right')
+plt.show()
