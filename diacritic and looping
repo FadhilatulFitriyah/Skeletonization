@@ -1,0 +1,257 @@
+# ==================== IMPORT ====================
+import numpy as np
+import matplotlib.pyplot as plt
+from skimage import io, color, measure
+from skimage.morphology import skeletonize
+from skimage.segmentation import relabel_sequential
+from scipy.ndimage import center_of_mass
+from scipy.spatial.distance import euclidean
+from shapely.geometry import Polygon
+import cv2 as cv
+import networkx as nx
+
+# =================== 1. LOAD GAMBAR DAN PREPROSESING ====================
+image_path = "p04-lineimg15.png"
+image = io.imread(image_path)
+if image.shape[2] == 4:
+    image = image[:, :, :3]
+
+gray = 1 - color.rgb2gray(image)
+gray_uint8 = (gray * 255).astype(np.uint8)
+_, binary = cv.threshold(gray_uint8, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU)
+
+# Cleaning dengan labeling
+labeled_image_raw, num_labels = measure.label(binary, return_num=True, connectivity=2)
+props_raw = measure.regionprops(labeled_image_raw)
+
+main_components = np.zeros_like(binary, dtype=bool)
+dot_components = np.zeros_like(binary, dtype=bool)
+
+for prop in props_raw:
+    if prop.area > 50:
+        main_components[labeled_image_raw == prop.label] = True
+    elif prop.area > 5:
+        min_distance = np.min([
+            np.linalg.norm(np.array(prop.centroid) - np.array(main_prop.centroid))
+            for main_prop in props_raw if main_prop.area > 45
+        ])
+        if min_distance <= 27:
+            dot_components[labeled_image_raw == prop.label] = True
+
+cleaned_binary = (main_components | dot_components).astype(np.uint8)
+
+# =================== 2. LABELING DAN DIAKRITIK ====================
+labeled_image, _ = measure.label(cleaned_binary, return_num=True, connectivity=2)
+props = measure.regionprops(labeled_image)
+
+main_components = np.zeros_like(cleaned_binary, dtype=bool)
+dot_mask = np.zeros_like(cleaned_binary, dtype=np.uint8)
+label_map = labeled_image.copy()
+main_infos = {}
+
+for prop in props:
+    label = prop.label
+    area = prop.area
+    bbox = prop.bbox
+    height = bbox[2] - bbox[0]
+    width = bbox[3] - bbox[1]
+    aspect_ratio = height / (width + 1e-5)
+    if area > 50 or (area > 10 and aspect_ratio > 3.5):
+        main_components[labeled_image == label] = True
+        main_infos[label] = {
+            "centroid": prop.centroid,
+            "bbox": prop.bbox,
+            "mask": (labeled_image == label)
+        }
+
+for prop in props:
+    label = prop.label
+    if label in main_infos or prop.area <= 2:
+        continue
+    centroid = prop.centroid
+    nearest_main = min(main_infos.items(), key=lambda item: euclidean(centroid, item[1]["centroid"]))[0]
+    dist = euclidean(centroid, main_infos[nearest_main]["centroid"])
+    if dist < 60:
+        cy, _ = map(int, centroid)
+        main_cy = int(main_infos[nearest_main]["centroid"][0])
+        dot_mask[labeled_image == label] = 1 if cy < main_cy else 2
+        label_map[labeled_image == label] = nearest_main
+
+labeled_image, _, _ = relabel_sequential(label_map)
+cleaned_binary = labeled_image > 0
+skeleton = skeletonize(cleaned_binary)
+
+# =================== 3. EKSTRAKSI FITUR STRUKTURAL ====================
+def find_keypoints(skel):
+    endpoints, intersections, turns = [], [], []
+    for i in range(1, skel.shape[0]-1):
+        for j in range(1, skel.shape[1]-1):
+            if skel[i, j]:
+                neighborhood = skel[i-1:i+2, j-1:j+2]
+                num_neighbors = np.sum(neighborhood) - 1
+                if num_neighbors == 1:
+                    endpoints.append((i, j))
+                elif num_neighbors >= 3:
+                    intersections.append((i, j))
+                else:
+                    h = skel[i, j-1] + skel[i, j+1]
+                    v = skel[i-1, j] + skel[i+1, j]
+                    if h == 1 and v == 1:
+                        turns.append((i, j))
+    return np.array(endpoints), np.array(intersections), np.array(turns)
+
+def skeleton_to_graph(skel):
+    G = nx.Graph()
+    for i in range(1, skel.shape[0]-1):
+        for j in range(1, skel.shape[1]-1):
+            if skel[i, j]:
+                for di in [-1, 0, 1]:
+                    for dj in [-1, 0, 1]:
+                        if di == 0 and dj == 0:
+                            continue
+                        ni, nj = i + di, j + dj
+                        if skel[ni, nj]:
+                            G.add_edge((i, j), (ni, nj))
+    return G
+
+component_features = {}
+for prop in measure.regionprops(labeled_image):
+    label = prop.label
+    if label == 0:
+        continue
+    mask = labeled_image == label
+    skel_component = skeleton * mask
+    endpoints, intersections, turns = find_keypoints(skel_component)
+    centroid = center_of_mass(mask)
+    dot_above, dot_below = [], []
+    dot_mask_region = dot_mask[mask]
+    if np.any(dot_mask_region == 1): dot_above.append(label)
+    if np.any(dot_mask_region == 2): dot_below.append(label)
+
+    component_features[label] = {
+        "skeleton_points": np.argwhere(skel_component),
+        "start": endpoints[0] if len(endpoints) > 0 else None,
+        "end": endpoints[-1] if len(endpoints) > 1 else None,
+        "intersections": intersections,
+        "turns": turns,
+        "centroid": centroid,
+        "dot_above": dot_above,
+        "dot_below": dot_below,
+        "has_loop": False,
+        "cycles": [],
+        "loop_count": 0,
+        "largest_loop_area": 0,
+        "bbox": prop.bbox
+    }
+
+# =================== 4. DETEKSI LOOP ====================
+def detect_looping_characters(component_features, skeleton, labeled_image):
+    looping_components = []
+
+    for label, feat in component_features.items():
+        mask = labeled_image == label
+        skel_component = skeleton * mask
+
+        if np.sum(skel_component) > 2:
+            G = skeleton_to_graph(skel_component)
+            cycles = nx.cycle_basis(G)
+
+            valid_cycles = []
+            for cycle in cycles:
+                if len(cycle) >= 2:
+                    cycle_array = np.array(cycle)
+                    try:
+                        polygon = Polygon(cycle_array[:, ::-1])
+                        area = polygon.area
+                    except:
+                        area = 0
+
+                    if area > 1.5:
+                        valid_cycles.append((cycle, area))
+
+            if valid_cycles:
+                looping_components.append(label)
+                component_features[label]["has_loop"] = True
+                component_features[label]["cycles"] = [vc[0] for vc in valid_cycles]
+                component_features[label]["loop_count"] = len(valid_cycles)
+                component_features[label]["largest_loop_area"] = max([vc[1] for vc in valid_cycles])
+    return looping_components, component_features
+
+looping_components, component_features = detect_looping_characters(component_features, skeleton, labeled_image)
+
+# =================== 5. VISUALISASI ====================
+fig, ax = plt.subplots(figsize=(10, 10))
+ax.imshow(skeleton, cmap='gray')
+legend_flag = {
+    "Start": True, "End": True, "Simpang": True,
+    "Belokan": True, "Centroid": True,
+    "Dot Atas": True, "Dot Bawah": True,
+    "Loop": True
+}
+
+for prop in props:
+    label = prop.label
+    if label in main_infos or prop.area <= 1:
+        continue
+    centroid_dot = np.array(prop.centroid)
+    dot_type = dot_mask[int(centroid_dot[0]), int(centroid_dot[1])]
+    if dot_type == 0:
+        continue
+    nearest_main_label = min(main_infos.items(), key=lambda item: euclidean(centroid_dot, item[1]["centroid"]))[0]
+    main_mask = main_infos[nearest_main_label]["mask"]
+    main_coords = np.argwhere(main_mask)
+    x_target = int(centroid_dot[1])
+    candidates = main_coords[main_coords[:, 1] == x_target]
+    if len(candidates) == 0:
+        continue
+    if dot_type == 1:
+        verticals = candidates[candidates[:, 0] > centroid_dot[0]]
+    else:
+        verticals = candidates[candidates[:, 0] < centroid_dot[0]]
+    if len(verticals) == 0:
+        continue
+    idx = np.argmin(np.abs(verticals[:, 0] - centroid_dot[0]))
+    target_point = verticals[idx]
+    ax.plot([centroid_dot[1], target_point[1]], [centroid_dot[0], target_point[0]],
+            color='purple', linestyle='--', linewidth=1, alpha=0.6)
+
+for label, feat in component_features.items():
+    points = feat["skeleton_points"]
+    for p in points:
+        ax.plot(p[1], p[0], 'o', color='blue', markersize=3)
+
+    if feat["start"] is not None:
+        ax.plot(feat["start"][1], feat["start"][0], 'bo', markersize=6, label="Titik Awal" if legend_flag["Start"] else "")
+        legend_flag["Start"] = False
+    if feat["end"] is not None:
+        ax.plot(feat["end"][1], feat["end"][0], 'yo', markersize=6, label="Titik Akhir" if legend_flag["End"] else "")
+        legend_flag["End"] = False
+    for iy, ix in feat["intersections"]:
+        ax.plot(ix, iy, 'go', markersize=5, label="Simpangan" if legend_flag["Simpang"] else "")
+        legend_flag["Simpang"] = False
+    for ty, tx in feat["turns"]:
+        ax.plot(tx, ty, 'co', markersize=4, label="Belokan" if legend_flag["Belokan"] else "")
+        legend_flag["Belokan"] = False
+    if feat["centroid"] is not None:
+        ax.plot(feat["centroid"][1], feat["centroid"][0], 'ro', markersize=6, label="Centroid" if legend_flag["Centroid"] else "")
+        legend_flag["Centroid"] = False
+    if feat["has_loop"]:
+        for cycle in feat["cycles"]:
+            cycle_array = np.array(cycle)
+            ax.plot(cycle_array[:, 1], cycle_array[:, 0], 'r-', linewidth=2, label="Loop" if legend_flag["Loop"] else "")
+            legend_flag["Loop"] = False
+
+dot_above_pts = np.argwhere(dot_mask == 1)
+if len(dot_above_pts) > 0:
+    ax.plot(dot_above_pts[:,1], dot_above_pts[:,0], 'o', color='magenta', markersize=6, label="Diakritik Atas" if legend_flag["Dot Atas"] else "")
+    legend_flag["Dot Atas"] = False
+
+dot_below_pts = np.argwhere(dot_mask == 2)
+if len(dot_below_pts) > 0:
+    ax.plot(dot_below_pts[:,1], dot_below_pts[:,0], 'o', color='orange', markersize=6, label="Diakritik Bawah" if legend_flag["Dot Bawah"] else "")
+    legend_flag["Dot Bawah"] = False
+
+ax.set_title("Analisis Struktur Skeleton dan Diakritik")
+ax.axis('off')
+ax.legend(loc='upper right')
+plt.show()
