@@ -1,0 +1,187 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import networkx as nx
+from skimage.morphology import skeletonize
+from skimage.measure import regionprops, label
+import csv
+import os
+
+# ==================== DIRECTION MAP ====================
+DIRECTION_MAP = {
+    (0, 1): 0, (-1, 1): 1, (-1, 0): 2, (-1, -1): 3,
+    (0, -1): 4, (1, -1): 5, (1, 0): 6, (1, 1): 7
+}
+
+def get_freeman_direction(p1, p2):
+    dy = p2[0] - p1[0]
+    dx = p2[1] - p1[1]
+    return DIRECTION_MAP.get((dy, dx), -1)
+
+# ==================== SKELETON TO GRAPH ====================
+def skeleton_to_graph(skel):
+    G = nx.Graph()
+    for y in range(skel.shape[0]):
+        for x in range(skel.shape[1]):
+            if skel[y, x]:
+                for dy in [-1, 0, 1]:
+                    for dx in [-1, 0, 1]:
+                        if dy == 0 and dx == 0:
+                            continue
+                        ny, nx_ = y + dy, x + dx
+                        if 0 <= ny < skel.shape[0] and 0 <= nx_ < skel.shape[1] and skel[ny, nx_]:
+                            G.add_edge((y, x), (ny, nx_))
+    return G
+
+def dfs_traverse(G, start):
+    visited = set()
+    path = []
+    def dfs(u):
+        visited.add(u)
+        path.append(u)
+        for v in sorted(G.neighbors(u), key=lambda p: (-p[1], p[0])):
+            if v not in visited:
+                dfs(v)
+    dfs(start)
+    return path
+
+def fallback_path(G, endpoints):
+    max_len = 0
+    best_path = []
+    for i in range(len(endpoints)):
+        for j in range(i + 1, len(endpoints)):
+            u, v = endpoints[i], endpoints[j]
+            if nx.has_path(G, u, v):
+                try:
+                    p = nx.shortest_path(G, source=u, target=v)
+                    if len(p) > max_len:
+                        max_len = len(p)
+                        best_path = p
+                except:
+                    continue
+    return best_path
+
+# ==================== SIAPKAN CSV & FOLDER OUTPUT ====================
+all_freeman_rows = []
+os.makedirs("hasil_csv", exist_ok=True)
+
+# ==================== PROSES HURUF UTAMA ====================
+huruf_props = [regionprops((mask * 1).astype(np.uint8))[0] for mask in sorted_hasil_potongan]
+
+for idx, region_mask in enumerate(sorted_hasil_potongan):
+    skel = skeletonize(region_mask)
+    G = skeleton_to_graph(skel)
+    endpoints_G = [node for node in G.nodes if G.degree[node] == 1]
+    loop_list = nx.cycle_basis(G)
+
+    path = []
+
+    if loop_list:
+        prefer_start = sorted(G.nodes, key=lambda p: (-p[1], p[0]))[0]
+        path = dfs_traverse(G, prefer_start)
+        print(f"Huruf ke-{idx+1}: LOOP detected → DFS dari {prefer_start}")
+    elif len(endpoints_G) >= 2:
+        prefer_start = sorted(endpoints_G, key=lambda p: (-p[1], p[0]))[0]
+        prefer_end = sorted(endpoints_G, key=lambda p: (p[1], -p[0]))[0]
+        if nx.has_path(G, prefer_start, prefer_end):
+            path = nx.shortest_path(G, source=prefer_start, target=prefer_end)
+        else:
+            print(f"Huruf ke-{idx+1}: fallback dipakai.")
+            path = fallback_path(G, endpoints_G)
+    else:
+        points = np.argwhere(skel)
+        path = sorted(points.tolist(), key=lambda p: (-p[1], p[0]))
+
+    if len(path) < 2:
+        print(f"Huruf ke-{idx+1}: path terlalu pendek.")
+        continue
+
+    chaincode = [get_freeman_direction(path[i], path[i+1]) for i in range(len(path)-1)]
+
+    # Visualisasi
+    plt.figure(figsize=(4, 4))
+    plt.imshow(skel, cmap='gray')
+    for i in range(len(path) - 1):
+        y1, x1 = path[i]
+        y2, x2 = path[i + 1]
+        dx = x2 - x1
+        dy = y2 - y1
+        plt.arrow(x1, y1, dx, dy, head_width=0.5, head_length=0.5, fc='red', ec='red')
+    plt.plot(path[0][1], path[0][0], 'go', label='Start')
+    plt.plot(path[-1][1], path[-1][0], 'bo', label='End')
+    plt.title(f"Huruf ke-{idx+1} - Freeman Chaincode")
+    plt.axis('off')
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    print(f"Huruf ke-{idx+1} - Freeman Chaincode:")
+    print(chaincode)
+
+    # Simpan ke CSV
+    all_freeman_rows.append(["huruf", idx + 1, "", ' '.join(map(str, chaincode))])
+
+# ==================== PROSES TITIK DIAKRITIK ====================
+dot_labels = label(dot_mask)
+dot_props = regionprops(dot_labels)
+
+for d_idx, prop in enumerate(dot_props):
+    cy, cx = map(int, prop.centroid)
+    found = False
+    for h_idx, huruf in enumerate(huruf_props):
+        minr, minc, maxr, maxc = huruf.bbox
+        if minr <= cy <= maxr and minc <= cx <= maxc:
+            found = True
+            break
+    if not found:
+        print(f"Titik Diakritik ke-{d_idx+1} tidak terasosiasi dengan huruf manapun")
+
+    dot_mask_i = (dot_labels == prop.label).astype(np.uint8)
+    skel_dot = skeletonize(dot_mask_i)
+    G_dot = skeleton_to_graph(skel_dot)
+    endpoints_dot = [node for node in G_dot.nodes if G_dot.degree[node] == 1]
+    path_dot = []
+
+    if len(endpoints_dot) >= 2:
+        start = sorted(endpoints_dot, key=lambda p: (-p[1], p[0]))[0]
+        end = sorted(endpoints_dot, key=lambda p: (p[1], -p[0]))[0]
+        if nx.has_path(G_dot, start, end):
+            path_dot = nx.shortest_path(G_dot, source=start, target=end)
+    else:
+        points = np.argwhere(skel_dot)
+        path_dot = sorted(points.tolist(), key=lambda p: (-p[1], p[0]))
+
+    if len(path_dot) >= 2:
+        chaincode_dot = [get_freeman_direction(path_dot[i], path_dot[i+1]) for i in range(len(path_dot)-1)]
+
+        # Visualisasi
+        plt.figure(figsize=(3, 3))
+        plt.imshow(skel_dot, cmap='gray')
+        for i in range(len(path_dot) - 1):
+            y1, x1 = path_dot[i]
+            y2, x2 = path_dot[i + 1]
+            dx = x2 - x1
+            dy = y2 - y1
+            plt.arrow(x1, y1, dx, dy, head_width=0.4, head_length=0.4, fc='blue', ec='blue')
+        plt.plot(path_dot[0][1], path_dot[0][0], 'go', label='Start')
+        plt.plot(path_dot[-1][1], path_dot[-1][0], 'bo', label='End')
+        plt.title(f"Titik Diakritik berasal dari Huruf ke-{h_idx+1}")
+        plt.axis('off')
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+        print(f"Titik Diakritik ke-{d_idx+1} - Freeman Chaincode:")
+        print(chaincode_dot)
+
+        # Simpan ke CSV
+        all_freeman_rows.append(["diakritik", d_idx + 1, h_idx + 1, ' '.join(map(str, chaincode_dot))])
+    else:
+        print(f"Titik Diakritik ke-{d_idx+1}: tidak cukup path untuk chaincode.")
+
+# ==================== SIMPAN CSV ====================
+with open("hasil_csv/freeman_chaincodes.csv", "w", newline='') as csvfile:
+    writer = csv.writer(csvfile)
+    writer.writerow(["Tipe", "Index", "HurufAsal", "Chaincode"])
+    writer.writerows(all_freeman_rows)
+
+print("✅ Freeman chaincodes berhasil disimpan ke hasil_csv/freeman_chaincodes.csv")
