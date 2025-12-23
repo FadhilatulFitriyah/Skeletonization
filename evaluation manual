@@ -1,0 +1,30 @@
+# ==================== Evaluasi Manual Segmentasi Huruf ====================
+
+# Input manual dari pengguna
+jumlah_GT = int(input("Masukkan jumlah Ground Truth (GT): "))
+jumlah_DT = int(input("Masukkan jumlah Deteksi (DT): "))
+TP = int(input("Masukkan jumlah True Positives (TP): "))
+FP = int(input("Masukkan jumlah False Positives (FP): "))
+FN = int(input("Masukkan jumlah False Negatives (FN): "))
+
+# Validasi konsistensi data (opsional tapi disarankan)
+if TP > jumlah_GT or TP > jumlah_DT:
+    print("\n[PERINGATAN] Nilai TP melebihi GT atau DT, cek kembali input Anda!")
+
+# Hitung metrik evaluasi
+accuracy = TP / (TP + FP + FN) if (TP + FP + FN) != 0 else 0
+precision = TP / (TP + FP) if (TP + FP) != 0 else 0
+recall = TP / (TP + FN) if (TP + FN) != 0 else 0
+f1_score = 2 * precision * recall / (precision + recall) if (precision + recall) != 0 else 0
+
+# Tampilkan hasil evaluasi
+print("\n===== Hasil Evaluasi Otomatis Segmentasi Huruf =====")
+print(f"GT (Ground Truth) : {jumlah_GT}")
+print(f"DT (Detected)     : {jumlah_DT}")
+print(f"TP (Benar)        : {TP}")
+print(f"FP (Salah)        : {FP}")
+print(f"FN (Terlewat)     : {FN}")
+print(f"Accuracy          : {accuracy:.3f}")
+print(f"Precision         : {precision:.3f}")
+print(f"Recall            : {recall:.3f}")
+print(f"F1 Score          : {f1_score:.3f}")
