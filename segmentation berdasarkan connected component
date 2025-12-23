@@ -1,0 +1,208 @@
+import matplotlib.pyplot as plt
+from skimage.morphology import skeletonize
+from skimage import io, color, measure
+from scipy.ndimage import center_of_mass
+import numpy as np
+import cv2 as cv
+from skimage.segmentation import relabel_sequential
+from scipy.spatial.distance import euclidean
+import networkx as nx
+from scipy.spatial import ConvexHull
+
+# ==================== Fungsi Gabungkan Diakritik ====================
+def gabungkan_diakritik_dan_mainstroke(binary, area_main=50, area_dot=2, jarak_maks=60):
+    labeled_image, _ = measure.label(binary, return_num=True, connectivity=2)
+    props = measure.regionprops(labeled_image)
+
+    main_components = np.zeros_like(binary, dtype=bool)
+    dot_mask = np.zeros_like(binary, dtype=np.uint8)
+    label_map = labeled_image.copy()
+    main_infos = {}
+
+    for prop in props:
+        label = prop.label
+        area = prop.area
+        bbox = prop.bbox
+        height = bbox[2] - bbox[0]
+        width = bbox[3] - bbox[1]
+        aspect_ratio = height / (width + 1e-5)
+
+        if area > area_main or (area > 10 and aspect_ratio > 3.5):
+            main_components[labeled_image == label] = True
+            main_infos[label] = {
+                "centroid": prop.centroid,
+                "bbox": prop.bbox,
+                "mask": (labeled_image == label)
+            }
+
+    for prop in props:
+        label = prop.label
+        if label in main_infos or prop.area <= area_dot:
+            continue
+        centroid = prop.centroid
+        nearest_main = min(main_infos.items(), key=lambda item: euclidean(centroid, item[1]["centroid"]))[0]
+        dist = euclidean(centroid, main_infos[nearest_main]["centroid"])
+
+        if dist < jarak_maks:
+            cy, _ = map(int, centroid)
+            main_cy = int(main_infos[nearest_main]["centroid"][0])
+            dot_mask[labeled_image == label] = 1 if cy < main_cy else 2
+            label_map[labeled_image == label] = nearest_main
+
+    labeled_image, _, _ = relabel_sequential(label_map)
+    cleaned_binary = labeled_image > 0
+
+    return labeled_image, cleaned_binary, dot_mask
+
+# ==================== Bagian 1: Preprocessing dan Skeletonisasi ====================
+image_path = "new.png"
+image = io.imread(image_path)
+
+if image.shape[2] == 4:
+    image = image[:, :, :3]
+
+gray_float = color.rgb2gray(image)
+gray_inverted = 1 - gray_float
+gray_uint8 = (gray_inverted * 255).astype(np.uint8)
+
+_, binary = cv.threshold(gray_uint8, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU)
+
+labeled_letters, cleaned_binary, dot_mask = gabungkan_diakritik_dan_mainstroke(binary)
+skeleton_used = skeletonize(cleaned_binary)
+
+# ==================== Fungsi Titik Penting dan Skeleton ke Graph ====================
+def find_endpoints(skel):
+    endpoints, intersections, turns = [], [], []
+    for i in range(1, skel.shape[0] - 1):
+        for j in range(1, skel.shape[1] - 1):
+            if skel[i, j]:
+                neighborhood = skel[i-1:i+2, j-1:j+2]
+                num_neighbors = np.sum(neighborhood) - 1
+                if num_neighbors == 1:
+                    endpoints.append((i, j))
+                elif num_neighbors >= 3:
+                    intersections.append((i, j))
+                else:
+                    horizontal = skel[i, j-1] + skel[i, j+1]
+                    vertical = skel[i-1, j] + skel[i+1, j]
+                    if horizontal == 1 and vertical == 1:
+                        turns.append((i, j))
+    return np.array(endpoints), np.array(intersections), np.array(turns)
+
+def skeleton_to_graph(skel):
+    G = nx.Graph()
+    for i in range(1, skel.shape[0] - 1):
+        for j in range(1, skel.shape[1] - 1):
+            if skel[i, j]:
+                for di in [-1, 0, 1]:
+                    for dj in [-1, 0, 1]:
+                        if di == 0 and dj == 0:
+                            continue
+                        ni, nj = i + di, j + dj
+                        if skel[ni, nj]:
+                            G.add_edge((i, j), (ni, nj))
+    return G
+
+# ==================== Ekstraksi Fitur Tiap Huruf ====================
+num_features = np.max(labeled_letters)
+letter_features = {}
+
+for region_label in range(1, num_features + 1):
+    single_letter = (labeled_letters == region_label)
+    letter_skeleton = skeleton_used * single_letter
+
+    endpoints, intersections, turns = find_endpoints(letter_skeleton)
+    centroid = center_of_mass(single_letter)
+
+    letter_features[region_label] = {
+        "start": endpoints[0] if len(endpoints) >= 1 else None,
+        "end": endpoints[-1] if len(endpoints) >= 2 else None,
+        "intersections": intersections,
+        "turns": turns,
+        "centroid": centroid
+    }
+
+# ==================== Urutkan Huruf dari Kanan ke Kiri ====================
+sorted_labels = sorted(letter_features.keys(), key=lambda l: -letter_features[l]['centroid'][1])
+
+# ==================== Visualisasi per Huruf ====================
+for idx, region_label in enumerate(sorted_labels, start=1):
+    fig, ax = plt.subplots(2, 1, figsize=(4, 8))
+
+    single_letter = (labeled_letters == region_label)
+    letter_skeleton = skeleton_used * single_letter
+
+    has_loop = False
+    cycles = []
+    loop_count = 0
+    largest_loop_area = 0
+
+    if np.sum(letter_skeleton) > 2:
+        G = skeleton_to_graph(letter_skeleton)
+        all_cycles = nx.cycle_basis(G)
+
+        valid_cycles = []
+        for cycle in all_cycles:
+            if len(cycle) >= 2:
+                cycle_array = np.array(cycle)
+                try:
+                    hull = ConvexHull(cycle_array)
+                    area = hull.volume
+                except:
+                    area = 0
+                if area > 1.5:
+                    valid_cycles.append((cycle, area))
+
+        if valid_cycles:
+            has_loop = True
+            cycles = [vc[0] for vc in valid_cycles]
+            loop_count = len(valid_cycles)
+            largest_loop_area = max(vc[1] for vc in valid_cycles)
+
+    letter_features[region_label].update({
+        "has_loop": has_loop,
+        "cycles": cycles,
+        "loop_count": loop_count,
+        "largest_loop_area": largest_loop_area
+    })
+
+    ax[0].imshow(single_letter, cmap='gray')
+    ax[0].set_title(f'Huruf ke-{idx} (Biner)')
+    ax[0].axis('off')
+
+    ax[1].imshow(letter_skeleton, cmap='gray')
+    features = letter_features[region_label]
+
+    if features["start"] is not None:
+        sy, sx = features["start"]
+        ax[1].plot(sx, sy, 'bo', markersize=5, label="Start")
+
+    if features["end"] is not None:
+        ey, ex = features["end"]
+        ax[1].plot(ex, ey, 'yo', markersize=5, label="End")
+
+    for iy, ix in features["intersections"]:
+        ax[1].plot(ix, iy, 'go', markersize=2, label="Intersection")
+
+    for ty, tx in features["turns"]:
+        ax[1].plot(tx, ty, 'co', markersize=3, label="Turn")
+
+    if features["centroid"] is not None:
+        cy, cx = features["centroid"]
+        ax[1].plot(cx, cy, 'ro', markersize=5, label="Centroid")
+
+    if features["has_loop"]:
+        for cycle in features["cycles"]:
+            cycle_array = np.array(cycle)
+            ax[1].plot(cycle_array[:, 1], cycle_array[:, 0], 'r-', linewidth=1.5, label="Loop")
+
+    ax[1].set_title(f'Huruf ke-{idx} (Skeleton)')
+    ax[1].axis('off')
+
+    handles, labels = ax[1].get_legend_handles_labels()
+    by_label = dict(zip(labels, handles))
+    ax[1].legend(by_label.values(), by_label.keys(), loc='upper right')
+
+    plt.tight_layout()
+    plt.show()
+
