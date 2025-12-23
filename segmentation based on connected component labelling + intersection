@@ -1,0 +1,326 @@
+# ==================== IMPORT ====================
+import matplotlib.pyplot as plt
+from skimage.morphology import skeletonize
+from skimage import io, color, measure
+from scipy.ndimage import center_of_mass
+import numpy as np
+import cv2 as cv
+from skimage.segmentation import relabel_sequential
+from scipy.spatial.distance import euclidean
+import networkx as nx
+from scipy.spatial import ConvexHull
+import os
+from skimage.measure import regionprops
+
+
+def hapus_noise(binary, min_area=5):
+    """Menghapus komponen kecil dari citra biner berdasarkan threshold luas minimum."""
+    labeled, num = measure.label(binary, return_num=True, connectivity=2)
+    props = measure.regionprops(labeled)
+
+    clean_binary = np.zeros_like(binary, dtype=bool)
+    for prop in props:
+        if prop.area >= min_area:
+            clean_binary[labeled == prop.label] = True
+    return clean_binary
+
+
+# ==================== FUNGSI ====================
+def gabungkan_diakritik_dan_mainstroke(binary, area_main=50, area_dot=2, jarak_maks=60, rasio_alif=2.5):
+    labeled_image, _ = measure.label(binary, return_num=True, connectivity=2)
+    props = measure.regionprops(labeled_image)
+
+    main_components = np.zeros_like(binary, dtype=bool)
+    dot_mask = np.zeros_like(binary, dtype=np.uint8)
+    label_map = labeled_image.copy()
+    main_infos = {}
+
+    # Identifikasi komponen utama (huruf)
+    for prop in props:
+        label = prop.label
+        area = prop.area
+        bbox = prop.bbox
+        height = bbox[2] - bbox[0]
+        width = bbox[3] - bbox[1]
+        aspect_ratio = height / (width + 1e-5)
+
+        if area > area_main or (area > 10 and aspect_ratio > 3.5):
+            main_components[labeled_image == label] = True
+            main_infos[label] = {
+                "centroid": prop.centroid,
+                "bbox": prop.bbox,
+                "mask": (labeled_image == label)
+            }
+
+    # Gabungkan titik dengan huruf terdekat
+    for prop in props:
+        label = prop.label
+        area = prop.area
+        if label in main_infos or area <= area_dot:
+            continue
+
+        bbox = prop.bbox
+        height = bbox[2] - bbox[0]
+        width = bbox[3] - bbox[1]
+        aspect_ratio = height / (width + 1e-5)
+
+        # Deteksi Alif atau bentuk vertikal, jangan anggap sebagai diakritik
+        if area > area_dot and aspect_ratio > rasio_alif:
+            continue
+
+        centroid = prop.centroid
+        if not main_infos:
+            continue
+        nearest_main = min(main_infos.items(), key=lambda item: euclidean(centroid, item[1]["centroid"]))[0]
+        dist = euclidean(centroid, main_infos[nearest_main]["centroid"])
+        if dist < jarak_maks:
+            cy, _ = map(int, centroid)
+            main_cy = int(main_infos[nearest_main]["centroid"][0])
+            dot_mask[labeled_image == label] = 1 if cy < main_cy else 2
+            label_map[labeled_image == label] = nearest_main
+
+    labeled_image, _, _ = relabel_sequential(label_map)
+    cleaned_binary = labeled_image > 0
+    return labeled_image, cleaned_binary, dot_mask
+
+
+def find_endpoints(skel):
+    endpoints, intersections, turns = [], [], []
+    for i in range(1, skel.shape[0] - 1):
+        for j in range(1, skel.shape[1] - 1):
+            if skel[i, j]:
+                neighborhood = skel[i-1:i+2, j-1:j+2]
+                num_neighbors = np.sum(neighborhood) - 1
+                if num_neighbors == 1:
+                    endpoints.append((i, j))
+                elif num_neighbors >= 3:
+                    intersections.append((i, j))
+                else:
+                    horizontal = skel[i, j-1] + skel[i, j+1]
+                    vertical = skel[i-1, j] + skel[i+1, j]
+                    if horizontal == 1 and vertical == 1:
+                        turns.append((i, j))
+    return np.array(endpoints), np.array(intersections), np.array(turns)
+
+
+def skeleton_to_graph(skel):
+    G = nx.Graph()
+    for i in range(1, skel.shape[0] - 1):
+        for j in range(1, skel.shape[1] - 1):
+            if skel[i, j]:
+                for di in [-1, 0, 1]:
+                    for dj in [-1, 0, 1]:
+                        if di == 0 and dj == 0:
+                            continue
+                        ni, nj = i + di, j + dj
+                        if skel[ni, nj]:
+                            G.add_edge((i, j), (ni, nj))
+    return G
+
+
+def deteksi_loop(letter_skeleton):
+    G = skeleton_to_graph(letter_skeleton)
+    all_cycles = nx.cycle_basis(G)
+    valid_cycles = []
+    for cycle in all_cycles:
+        if len(cycle) >= 2:
+            cycle_array = np.array(cycle)
+            try:
+                hull = ConvexHull(cycle_array)
+                area = hull.volume
+            except:
+                area = 0
+            if area > 1.5:
+                valid_cycles.append((cycle, area))
+    return valid_cycles
+
+
+def potong_persimpangan(labeled_letters, skeleton_used, jarak_potong=1, min_shift=2):
+    hasil_potongan = []
+    num_features = np.max(labeled_letters)
+
+    for region_label in range(1, num_features + 1):
+        mask = (labeled_letters == region_label)
+        if np.sum(mask) < 5:
+            continue
+
+        letter_skeleton = skeleton_used * mask
+        coords = np.argwhere(mask)
+        endpoints, intersections, _ = find_endpoints(letter_skeleton)
+
+        x_coords = coords[:, 1]
+        width = x_coords.max() - x_coords.min()
+
+        if len(intersections) == 0:
+            hasil_potongan.append(mask)
+            continue
+
+        cut_points = []
+        for iy, ix in intersections:
+            cut_x = ix + max(jarak_potong, min_shift)
+            minc = x_coords.min()
+            maxc = x_coords.max()
+            cut_x = int(np.clip(cut_x, minc, maxc))
+            cut_points.append(cut_x)
+
+        cuts = sorted(set([x_coords.min()] + cut_points + [x_coords.max() + 1]))
+        cuts = [max(x_coords.min(), min(c, x_coords.max() + 1)) for c in cuts]
+
+        for i in range(len(cuts) - 1):
+            region_mask = np.zeros_like(mask)
+            region_mask[:, cuts[i]:cuts[i + 1]] = mask[:, cuts[i]:cuts[i + 1]]
+            if np.sum(region_mask) > 15:
+                hasil_potongan.append(region_mask)
+
+    return hasil_potongan
+
+
+def tsp_skeleton_traversal(points, prefer_lower=True, dist_threshold=3):
+    if len(points) == 0:
+        return []
+    points = points.tolist()
+    points.sort(key=lambda p: (-p[0], p[1]))
+    start_point = points.pop(0)
+    path = [start_point]
+    segments = []
+    current_segment = [start_point]
+    while points:
+        last = path[-1]
+        distances = [euclidean(last, p) for p in points]
+        idx_min = np.argmin(distances)
+        next_point = points.pop(idx_min)
+        dist = euclidean(last, next_point)
+        if dist > dist_threshold:
+            segments.append(current_segment)
+            current_segment = [next_point]
+        else:
+            current_segment.append(next_point)
+        path.append(next_point)
+    segments.append(current_segment)
+    return segments
+
+
+# ==================== MAIN ====================
+image_path = "ris.png"
+image = io.imread(image_path)
+if image.shape[2] == 4:
+    image = image[:, :, :3]
+gray = 1 - color.rgb2gray(image)
+gray_uint8 = (gray * 255).astype(np.uint8)
+_, binary = cv.threshold(gray_uint8, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU)
+
+binary = hapus_noise(binary, min_area=5)
+labeled_letters, cleaned_binary, dot_mask = gabungkan_diakritik_dan_mainstroke(binary)
+skeleton_used = skeletonize(cleaned_binary)
+
+# ==================== Fitur per Komponen ====================
+component_features = {}
+for region_label in range(1, np.max(labeled_letters) + 1):
+    mask = (labeled_letters == region_label)
+    if np.sum(mask) < 5:
+        continue
+    letter_skeleton = skeleton_used * mask
+    endpoints, intersections, _ = find_endpoints(letter_skeleton)
+    loops = deteksi_loop(letter_skeleton)
+    component_features[region_label] = {
+        "intersections": intersections,
+        "has_loop": len(loops) > 0,
+        "cycles": [cycle for cycle, _ in loops]
+    }
+
+
+# ==================== UNIFIED GARIS POTONG TANPA LOOP ====================
+def hitung_garis_potong(component_features, binary_image, labeled_letters, min_gap=3):
+    all_cols = []
+    for label, feat in component_features.items():
+        mask = (labeled_letters == label)
+        if np.sum(mask) < 5:
+            continue
+
+        coords = np.argwhere(mask)
+        x_coords = coords[:, 1]
+        width = x_coords.max() - x_coords.min()
+
+        endpoints, _, _ = find_endpoints(skeletonize(mask))
+        is_single_char = (len(endpoints) <= 2 and width < 50 and np.sum(mask) < 500)
+        if is_single_char:
+            continue
+
+        # hanya intersection, loop dihapus
+        if len(feat["intersections"]) > 0:
+            for iy, ix in feat["intersections"]:
+                all_cols.append(ix)
+
+    all_cols += [0, binary_image.shape[1] - 1]
+
+    all_cols = sorted(set(all_cols))
+    merged_cols = [all_cols[0]]
+    for col in all_cols[1:]:
+        if col - merged_cols[-1] < min_gap:
+            merged_cols[-1] = (merged_cols[-1] + col) // 2
+        else:
+            merged_cols.append(col)
+
+    return merged_cols
+
+
+def tampilkan_garis_potong_skeleton_dan_biner(component_features, cleaned_binary, skeleton_used, labeled_letters):
+    merged_cols = hitung_garis_potong(component_features, cleaned_binary, labeled_letters)
+    fig, ax = plt.subplots(1, 2, figsize=(12, 6))
+    ax[0].imshow(skeleton_used, cmap='gray')
+    for col in merged_cols:
+        ax[0].axvline(x=col, color='red', linestyle='--', linewidth=1.5)
+    ax[0].set_title("Perpotongan pada Skeleton")
+    ax[0].axis('off')
+
+    ax[1].imshow(cleaned_binary, cmap='gray')
+    for col in merged_cols:
+        ax[1].axvline(x=col, color='red', linestyle='--', linewidth=1.5)
+    ax[1].set_title("Perpotongan pada Biner")
+    ax[1].axis('off')
+
+    plt.tight_layout()
+    plt.show()
+
+
+# ==================== PEMANGGILAN ====================
+tampilkan_garis_potong_skeleton_dan_biner(component_features, cleaned_binary, skeleton_used, labeled_letters)
+hasil_potongan = potong_persimpangan(labeled_letters, skeleton_used)
+sorted_hasil_potongan = sorted(hasil_potongan, key=lambda mask: np.max(np.argwhere(mask)[:, 1]), reverse=True)
+
+output_folder = "hasil_potongan"
+os.makedirs(output_folder, exist_ok=True)
+for idx, region_mask in enumerate(sorted_hasil_potongan):
+    output_image = (region_mask * 255).astype(np.uint8)
+    output_filename = os.path.join(output_folder, f'potongan_huruf_{idx + 1}.png')
+    cv.imwrite(output_filename, output_image)
+
+print(f"Hasil potongan huruf disimpan di folder: {output_folder}")
+
+# ==================== PEMANGGILAN ====================
+tampilkan_garis_potong_skeleton_dan_biner(component_features, cleaned_binary, skeleton_used, labeled_letters)
+
+hasil_potongan = potong_persimpangan(labeled_letters, skeleton_used)
+sorted_hasil_potongan = sorted(
+    hasil_potongan,
+    key=lambda mask: np.max(np.argwhere(mask)[:, 1]),
+    reverse=True
+)
+
+output_folder = "hasil_potongan"
+os.makedirs(output_folder, exist_ok=True)
+
+for idx, region_mask in enumerate(sorted_hasil_potongan):
+    output_image = (region_mask * 255).astype(np.uint8)
+    output_filename = os.path.join(output_folder, f'potongan_huruf_{idx + 1}.png')
+    cv.imwrite(output_filename, output_image)
+
+    # --- tampilkan hasil potongan ---
+    plt.figure(figsize=(3, 3))
+    plt.imshow(region_mask, cmap="gray")
+    plt.title(f"Huruf {idx+1}")
+    plt.axis("off")
+    plt.show()
+
+print(f"Hasil potongan huruf disimpan di folder: {output_folder}")
+
